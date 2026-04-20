@@ -5151,88 +5151,25 @@ window.AppServices = new class ServiceLocator {
     this.register("blockHardness", window.BLOCK_HARDNESS);
     this.register("blockLightLut", window.BLOCK_LIGHT_LUT);
     this.register("structuresJson", window.TU_STRUCTURES_JSON);
-    // === StorageAdapter: LS -> IDB -> Lite degradation with explicit error surfacing ===
-    // Replaces raw localStorage wrapper. Tracks degradation state and exposes quota errors.
-    const _StorageAdapter = {
-      _mode: 'localStorage',  // 'localStorage' | 'indexedDB' | 'memory'
-      _degraded: false,
-      _degradeReason: null,
-      _memoryFallback: new Map(),  // Last-resort in-memory store
-      _quotaErrorCount: 0,
-
-      get(k) {
+    this.register("storage", {
+      get: k => {
         try {
-          if (this._mode === 'memory') return this._memoryFallback.get(k) || null;
           return localStorage.getItem(k);
         } catch (e) {
-          console.error('[StorageAdapter] get failed:', e);
-          return this._memoryFallback.get(k) || null;
+          return null;
         }
       },
-
-      set(k, v) {
-        // Always write to memory fallback for safety
-        this._memoryFallback.set(k, v);
-        if (this._mode === 'memory') return;
+      set: (k, v) => {
         try {
           localStorage.setItem(k, v);
-        } catch (e) {
-          // Detect QuotaExceededError and degrade
-          if (e.name === 'QuotaExceededError' || (e.message && e.message.indexOf('quota') !== -1)) {
-            this._quotaErrorCount++;
-            console.error('[StorageAdapter] QuotaExceeded! Degrading to IDB. Count=' + this._quotaErrorCount);
-            this._degraded = true;
-            this._degradeReason = 'quota';
-            // Emit error for user notification
-            try {
-              if (window.GameEvents && window.GameEvents.emit) {
-                window.GameEvents.emit('storage:degraded', { reason: 'quota', mode: this._mode });
-                window.GameEvents.emit('ui:toast', '⚠️ 存储空间不足，已切换到备用存储', 3000);
-              }
-            } catch (_) {}
-            // Try IDB fallback
-            this._tryIDBSet(k, v);
-          } else {
-            console.error('[StorageAdapter] set failed:', e);
-          }
-        }
+        } catch(e){console.warn('[Catch]',e);}
       },
-
-      remove(k) {
-        this._memoryFallback.delete(k);
+      remove: k => {
         try {
-          if (this._mode !== 'memory') localStorage.removeItem(k);
-        } catch (e) { console.error('[StorageAdapter] remove failed:', e); }
-      },
-
-      async _tryIDBSet(k, v) {
-        try {
-          const idb = window.TU_IndexedDBStorage;
-          if (idb && typeof idb.set === 'function') {
-            await idb.set(k, v);
-            this._mode = 'indexedDB';
-            console.log('[StorageAdapter] Degraded to IndexedDB successfully');
-          } else {
-            this._mode = 'memory';
-            console.warn('[StorageAdapter] No IDB available, using memory fallback');
-          }
-        } catch (e) {
-          this._mode = 'memory';
-          console.error('[StorageAdapter] IDB degradation also failed, using memory:', e);
-        }
-      },
-
-      getStatus() {
-        return {
-          mode: this._mode,
-          degraded: this._degraded,
-          reason: this._degradeReason,
-          quotaErrors: this._quotaErrorCount,
-          memoryEntries: this._memoryFallback.size
-        };
+          window.localStorage.removeItem(k);
+        } catch(e){console.warn('[Catch]',e);}
       }
-    };
-    this.register("storage", _StorageAdapter);
+    });
     this.register("session", {
       get: k => {
         try {
@@ -10441,94 +10378,6 @@ const CONFIG = Object.freeze({
   });
 // Block IDs 0-161: frozen constants enable V8 optimization, stable IDs for serialization/networking
 window.Constants = Constants;
-
-// === BlockRegistry: Palette Mapping for Save Integrity ===
-// Prevents ID drift: maps block names to IDs bidirectionally.
-// When loading saves, the palette in the save header is compared against the current registry.
-// If IDs have shifted (e.g., due to patch order change), the registry remaps them.
-window.BlockRegistry = {
-  _nameToId: new Map(),
-  _idToName: new Map(),
-  _frozen: false,
-
-  /** Build registry from the frozen BLOCK constant */
-  init() {
-    if (this._frozen) return;
-    for (const [name, id] of Object.entries(BLOCK)) {
-      this._nameToId.set(name, id);
-      this._idToName.set(id, name);
-    }
-    this._frozen = true;
-    console.log('[BlockRegistry] Initialized with ' + this._nameToId.size + ' block types (max ID=' + Math.max(...this._idToName.keys()) + ')');
-  },
-
-  /** Get block ID by name */
-  getId(name) { return this._nameToId.get(name); },
-
-  /** Get block name by ID */
-  getName(id) { return this._idToName.get(id); },
-
-  /**
-   * Generate a palette for save headers.
-   * Format: Array of [id, name] pairs that can be embedded in save data.
-   * @returns {Array<[number, string]>}
-   */
-  exportPalette() {
-    const palette = [];
-    for (const [name, id] of this._nameToId) palette.push([id, name]);
-    return palette.sort((a, b) => a[0] - b[0]);
-  },
-
-  /**
-   * Build a remap table from a save's palette to current IDs.
-   * Returns null if no remapping is needed (all IDs match).
-   * @param {Array<[number, string]>} savedPalette - Palette from save header
-   * @returns {Uint16Array|null} Remap table: remapTable[oldId] = newId
-   */
-  buildRemapTable(savedPalette) {
-    if (!savedPalette || !savedPalette.length) return null;
-    let needsRemap = false;
-    const maxOldId = savedPalette.reduce((m, [id]) => Math.max(m, id), 0);
-    const remap = new Uint16Array(maxOldId + 1);
-    // Identity map
-    for (let i = 0; i <= maxOldId; i++) remap[i] = i;
-    for (const [oldId, name] of savedPalette) {
-      const currentId = this._nameToId.get(name);
-      if (currentId !== undefined && currentId !== oldId) {
-        remap[oldId] = currentId;
-        needsRemap = true;
-        console.warn('[BlockRegistry] Remap: ' + name + ' ' + oldId + ' -> ' + currentId);
-      } else if (currentId === undefined) {
-        console.warn('[BlockRegistry] Unknown block in save: ' + name + ' (id=' + oldId + '), mapping to AIR');
-        remap[oldId] = 0; // AIR
-        needsRemap = true;
-      }
-    }
-    return needsRemap ? remap : null;
-  },
-
-  /** Apply remap table to a world tiles array */
-  applyRemap(tiles, remap, worldW, worldH) {
-    if (!remap) return;
-    let remapped = 0;
-    for (let x = 0; x < worldW; x++) {
-      const col = tiles[x];
-      if (!col) continue;
-      for (let y = 0; y < worldH; y++) {
-        const oldId = col[y];
-        if (oldId < remap.length && remap[oldId] !== oldId) {
-          col[y] = remap[oldId];
-          remapped++;
-        }
-      }
-    }
-    if (remapped > 0) console.log('[BlockRegistry] Remapped ' + remapped + ' tiles');
-    return remapped;
-  }
-};
-// Auto-initialize
-window.BlockRegistry.init();
-window.TU && (window.TU.BlockRegistry = window.BlockRegistry);
 const BLOCK_DATA = {
     [BLOCK.AIR]: {
       name: "空气",
