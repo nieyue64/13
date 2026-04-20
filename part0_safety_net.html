@@ -5151,88 +5151,25 @@ window.AppServices = new class ServiceLocator {
     this.register("blockHardness", window.BLOCK_HARDNESS);
     this.register("blockLightLut", window.BLOCK_LIGHT_LUT);
     this.register("structuresJson", window.TU_STRUCTURES_JSON);
-    // === StorageAdapter: LS -> IDB -> Lite degradation with explicit error surfacing ===
-    // Replaces raw localStorage wrapper. Tracks degradation state and exposes quota errors.
-    const _StorageAdapter = {
-      _mode: 'localStorage',  // 'localStorage' | 'indexedDB' | 'memory'
-      _degraded: false,
-      _degradeReason: null,
-      _memoryFallback: new Map(),  // Last-resort in-memory store
-      _quotaErrorCount: 0,
-
-      get(k) {
+    this.register("storage", {
+      get: k => {
         try {
-          if (this._mode === 'memory') return this._memoryFallback.get(k) || null;
           return localStorage.getItem(k);
         } catch (e) {
-          console.error('[StorageAdapter] get failed:', e);
-          return this._memoryFallback.get(k) || null;
+          return null;
         }
       },
-
-      set(k, v) {
-        // Always write to memory fallback for safety
-        this._memoryFallback.set(k, v);
-        if (this._mode === 'memory') return;
+      set: (k, v) => {
         try {
           localStorage.setItem(k, v);
-        } catch (e) {
-          // Detect QuotaExceededError and degrade
-          if (e.name === 'QuotaExceededError' || (e.message && e.message.indexOf('quota') !== -1)) {
-            this._quotaErrorCount++;
-            console.error('[StorageAdapter] QuotaExceeded! Degrading to IDB. Count=' + this._quotaErrorCount);
-            this._degraded = true;
-            this._degradeReason = 'quota';
-            // Emit error for user notification
-            try {
-              if (window.GameEvents && window.GameEvents.emit) {
-                window.GameEvents.emit('storage:degraded', { reason: 'quota', mode: this._mode });
-                window.GameEvents.emit('ui:toast', '⚠️ 存储空间不足，已切换到备用存储', 3000);
-              }
-            } catch (_) {}
-            // Try IDB fallback
-            this._tryIDBSet(k, v);
-          } else {
-            console.error('[StorageAdapter] set failed:', e);
-          }
-        }
+        } catch(e){console.warn('[Catch]',e);}
       },
-
-      remove(k) {
-        this._memoryFallback.delete(k);
+      remove: k => {
         try {
-          if (this._mode !== 'memory') localStorage.removeItem(k);
-        } catch (e) { console.error('[StorageAdapter] remove failed:', e); }
-      },
-
-      async _tryIDBSet(k, v) {
-        try {
-          const idb = window.TU_IndexedDBStorage;
-          if (idb && typeof idb.set === 'function') {
-            await idb.set(k, v);
-            this._mode = 'indexedDB';
-            console.log('[StorageAdapter] Degraded to IndexedDB successfully');
-          } else {
-            this._mode = 'memory';
-            console.warn('[StorageAdapter] No IDB available, using memory fallback');
-          }
-        } catch (e) {
-          this._mode = 'memory';
-          console.error('[StorageAdapter] IDB degradation also failed, using memory:', e);
-        }
-      },
-
-      getStatus() {
-        return {
-          mode: this._mode,
-          degraded: this._degraded,
-          reason: this._degradeReason,
-          quotaErrors: this._quotaErrorCount,
-          memoryEntries: this._memoryFallback.size
-        };
+          window.localStorage.removeItem(k);
+        } catch(e){console.warn('[Catch]',e);}
       }
-    };
-    this.register("storage", _StorageAdapter);
+    });
     this.register("session", {
       get: k => {
         try {
@@ -8819,99 +8756,7 @@ class AudioManager {
       } catch(e){console.warn('[Catch]',e);}
     }
   }
-
-  // === NATIVE: Rain Synthesis (absorbed from __rainSynthInstalled patch) ===
-  _makeLoopNoiseBuffer(seconds) {
-    if (!this.ctx) return null;
-    try {
-      const sr = this.ctx.sampleRate, len = (sr * seconds) | 0;
-      const buf = this.ctx.createBuffer(1, len, sr), d = buf.getChannelData(0);
-      for (let i = 0; i < len; i++) d[i] = 2 * Math.random() - 1;
-      return buf;
-    } catch (e) { console.error("[AudioManager] _makeLoopNoiseBuffer failed:", e); return null; }
-  }
-
-  _startRainSynth() {
-    if (!this.ctx) return false;
-    if (this._rainSynth && this._rainSynth.active) return true;
-    const st = this._rainSynth || (this._rainSynth = { active: false, src: null, hp: null, lp: null, gain: null, dropAcc: 0 });
-    const buf = this._rainNoiseBuf || (this._rainNoiseBuf = this._makeLoopNoiseBuffer(2));
-    if (!buf) return false;
-    try {
-      const src = this.ctx.createBufferSource();
-      src.buffer = buf; src.loop = true;
-      const hp = this.ctx.createBiquadFilter(); hp.type = "highpass"; hp.frequency.value = 2200; hp.Q.value = 0.7;
-      const lp = this.ctx.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = 6000; lp.Q.value = 0.5;
-      const gain = this.ctx.createGain(); gain.gain.value = 0;
-      src.connect(hp); hp.connect(lp); lp.connect(gain); gain.connect(this.ctx.destination);
-      src.start();
-      st.src = src; st.hp = hp; st.lp = lp; st.gain = gain; st.active = true; st.dropAcc = 0;
-      return true;
-    } catch (e) { console.error("[AudioManager] _startRainSynth failed:", e); return false; }
-  }
-
-  _stopRainSynth() {
-    const st = this._rainSynth;
-    if (!st || !st.active) return;
-    try { st.src && st.src.stop(); } catch (_) {}
-    try { st.src && st.src.disconnect(); } catch (_) {}
-    try { st.hp && st.hp.disconnect(); } catch (_) {}
-    try { st.lp && st.lp.disconnect(); } catch (_) {}
-    try { st.gain && st.gain.disconnect(); } catch (_) {}
-    st.src = null; st.hp = null; st.lp = null; st.gain = null; st.active = false;
-  }
-
-  updateWeatherAmbience(dtMs, weather) {
-    const wType = weather && weather.type ? weather.type : "clear";
-    const wInt = weather && Number.isFinite(weather.intensity) ? weather.intensity : 0;
-    const wantRain = wInt > 0.06 && ("rain" === wType || "thunder" === wType);
-    if (void 0 === this.enabled) this.enabled = true;
-    if (!wantRain) { this._stopRainSynth(); return; }
-    if (!this._startRainSynth()) return;
-    const st = this._rainSynth;
-    if (!st || !st.gain) return;
-    const vol = (this.settings && this.settings.sfxVolume != null ? this.settings.sfxVolume : 0.5);
-    const target = Math.min(0.22, 0.04 + 0.16 * wInt) * vol;
-    const cur = st.gain.gain.value;
-    const lerp = 1 - Math.exp(-(dtMs || 16) / 600);
-    st.gain.gain.value = cur + (target - cur) * lerp;
-    if (st.hp) st.hp.frequency.value = 1800 + 600 * wInt;
-    if (st.lp) st.lp.frequency.value = 5000 + 2000 * (1 - wInt);
-  }
-
-  // === NATIVE: Cave Reverb (absorbed from __caveReverbInstalled patch) ===
-  _ensureCaveFx() {
-    if (!this.ctx || this._caveFx) return;
-    try {
-      const conv = this.ctx.createConvolver();
-      const sr = this.ctx.sampleRate, len = (sr * 1.2) | 0;
-      const impulse = this.ctx.createBuffer(2, len, sr);
-      for (let ch = 0; ch < 2; ch++) {
-        const d = impulse.getChannelData(ch);
-        for (let i = 0; i < len; i++) d[i] = (2 * Math.random() - 1) * Math.exp(-3 * i / len);
-      }
-      conv.buffer = impulse;
-      const wet = this.ctx.createGain(); wet.gain.value = 0;
-      conv.connect(wet); wet.connect(this.ctx.destination);
-      this._caveFx = { conv, wet, depth: 0, enclosed: 0 };
-    } catch (e) { console.error("[AudioManager] _ensureCaveFx failed:", e); }
-  }
-
-  setEnvironment(depth01, enclosed01) {
-    if (!this.ctx) return;
-    this._ensureCaveFx();
-    if (!this._caveFx) return;
-    const fx = this._caveFx;
-    fx.depth = Math.max(0, Math.min(1, depth01));
-    fx.enclosed = Math.max(0, Math.min(1, enclosed01));
-    const reverbAmount = Math.min(0.45, 0.1 * fx.depth + 0.25 * fx.enclosed);
-    fx.wet.gain.value = reverbAmount;
-  }
 }
-// Mark native methods as installed so monkey patches will skip
-AudioManager.prototype.__rainSynthInstalled = true;
-AudioManager.prototype.__caveReverbInstalled = true;
-AudioManager.prototype.__tuAudioVisPatch = true;
 Object.assign(window.TU, {
   AudioManager: AudioManager
 });
@@ -10441,94 +10286,6 @@ const CONFIG = Object.freeze({
   });
 // Block IDs 0-161: frozen constants enable V8 optimization, stable IDs for serialization/networking
 window.Constants = Constants;
-
-// === BlockRegistry: Palette Mapping for Save Integrity ===
-// Prevents ID drift: maps block names to IDs bidirectionally.
-// When loading saves, the palette in the save header is compared against the current registry.
-// If IDs have shifted (e.g., due to patch order change), the registry remaps them.
-window.BlockRegistry = {
-  _nameToId: new Map(),
-  _idToName: new Map(),
-  _frozen: false,
-
-  /** Build registry from the frozen BLOCK constant */
-  init() {
-    if (this._frozen) return;
-    for (const [name, id] of Object.entries(BLOCK)) {
-      this._nameToId.set(name, id);
-      this._idToName.set(id, name);
-    }
-    this._frozen = true;
-    console.log('[BlockRegistry] Initialized with ' + this._nameToId.size + ' block types (max ID=' + Math.max(...this._idToName.keys()) + ')');
-  },
-
-  /** Get block ID by name */
-  getId(name) { return this._nameToId.get(name); },
-
-  /** Get block name by ID */
-  getName(id) { return this._idToName.get(id); },
-
-  /**
-   * Generate a palette for save headers.
-   * Format: Array of [id, name] pairs that can be embedded in save data.
-   * @returns {Array<[number, string]>}
-   */
-  exportPalette() {
-    const palette = [];
-    for (const [name, id] of this._nameToId) palette.push([id, name]);
-    return palette.sort((a, b) => a[0] - b[0]);
-  },
-
-  /**
-   * Build a remap table from a save's palette to current IDs.
-   * Returns null if no remapping is needed (all IDs match).
-   * @param {Array<[number, string]>} savedPalette - Palette from save header
-   * @returns {Uint16Array|null} Remap table: remapTable[oldId] = newId
-   */
-  buildRemapTable(savedPalette) {
-    if (!savedPalette || !savedPalette.length) return null;
-    let needsRemap = false;
-    const maxOldId = savedPalette.reduce((m, [id]) => Math.max(m, id), 0);
-    const remap = new Uint16Array(maxOldId + 1);
-    // Identity map
-    for (let i = 0; i <= maxOldId; i++) remap[i] = i;
-    for (const [oldId, name] of savedPalette) {
-      const currentId = this._nameToId.get(name);
-      if (currentId !== undefined && currentId !== oldId) {
-        remap[oldId] = currentId;
-        needsRemap = true;
-        console.warn('[BlockRegistry] Remap: ' + name + ' ' + oldId + ' -> ' + currentId);
-      } else if (currentId === undefined) {
-        console.warn('[BlockRegistry] Unknown block in save: ' + name + ' (id=' + oldId + '), mapping to AIR');
-        remap[oldId] = 0; // AIR
-        needsRemap = true;
-      }
-    }
-    return needsRemap ? remap : null;
-  },
-
-  /** Apply remap table to a world tiles array */
-  applyRemap(tiles, remap, worldW, worldH) {
-    if (!remap) return;
-    let remapped = 0;
-    for (let x = 0; x < worldW; x++) {
-      const col = tiles[x];
-      if (!col) continue;
-      for (let y = 0; y < worldH; y++) {
-        const oldId = col[y];
-        if (oldId < remap.length && remap[oldId] !== oldId) {
-          col[y] = remap[oldId];
-          remapped++;
-        }
-      }
-    }
-    if (remapped > 0) console.log('[BlockRegistry] Remapped ' + remapped + ' tiles');
-    return remapped;
-  }
-};
-// Auto-initialize
-window.BlockRegistry.init();
-window.TU && (window.TU.BlockRegistry = window.BlockRegistry);
 const BLOCK_DATA = {
     [BLOCK.AIR]: {
       name: "空气",
@@ -21297,41 +21054,8 @@ class Renderer {
       ctx.drawImage(fvlBuf, 0, 0);
     }
     ctx.restore();
-    // === PostFX Pipeline: Execute registered stages in order ===
-    // This replaces the "onion model" of wrapping applyPostFX with nested closures.
-    // Stages are executed linearly: Base -> Weather Tint -> Underwater Fog -> etc.
-    // Each stage receives (renderer, ctx, time, depth01, reducedMotion) and draws directly.
-    if (this._postFxPipeline && this._postFxPipeline.length > 0) {
-      for (let i = 0, len = this._postFxPipeline.length; i < len; i++) {
-        const stage = this._postFxPipeline[i];
-        try {
-          stage.fn(this, ctx, time, depth01, reducedMotion);
-        } catch (e) {
-          console.error('[PostFX Pipeline] Stage "' + (stage.name || i) + '" failed:', e);
-        }
-      }
-    }
     window.GameEvents && window.GameEvents.emit && window.GameEvents.emit('renderer:postFX:complete', this, time, depth01, reducedMotion);
   }
-
-  /**
-   * Register a post-processing pipeline stage.
-   * Stages execute in order after the base postFX (bloom/fog/vignette/grain).
-   * @param {string} name - Stage identifier (e.g., 'weatherTint', 'underwaterFog')
-   * @param {number} order - Execution order (lower = earlier). Suggested: 10=weather, 20=underwater, 30=custom
-   * @param {Function} fn - Stage function: (renderer, ctx, time, depth01, reducedMotion) => void
-   * @returns {boolean} True if registered successfully
-   */
-  registerPostFxStage(name, order, fn) {
-    if (!this._postFxPipeline) this._postFxPipeline = [];
-    // Prevent duplicates
-    if (this._postFxPipeline.some(s => s.name === name)) return false;
-    this._postFxPipeline.push({ name, order: order || 0, fn });
-    this._postFxPipeline.sort((a, b) => a.order - b.order);
-    console.log('[PostFX Pipeline] Registered stage: ' + name + ' (order=' + order + ')');
-    return true;
-  }
-
   /**
    * @method postProcess
    * @description Convenience method for applyPostFX with default parameters.
@@ -23431,42 +23155,6 @@ class InputManager {
       passive: !0
     });
     canvas && canvas.addEventListener("contextmenu", e => e.preventDefault());
-    // === NATIVE SAFETY: Anti-stuck-key/button handlers (absorbed from monkey patch) ===
-    // Previously in __tuInputSafety patch; now part of native InputManager.bind()
-    const _resetMouseButtons = () => {
-      game && game.input && (window.GameEvents.emit('input:set', 'mouseLeft', false), window.GameEvents.emit('input:set', 'mouseRight', false));
-    };
-    const _resetAllInput = () => {
-      game && game.input && (window.GameEvents.emit('input:set', 'left', false), window.GameEvents.emit('input:set', 'right', false), window.GameEvents.emit('input:set', 'jump', false), window.GameEvents.emit('input:set', 'sprint', false));
-      _resetMouseButtons();
-    };
-    // Window blur/tab switch: avoid "stuck key/button"
-    window.addEventListener("blur", _resetAllInput, { passive: true });
-    document.addEventListener("visibilitychange", () => { document.hidden && _resetAllInput(); }, { passive: true });
-    // Mouse leaves canvas: clear mouse buttons to avoid "stuck mining/placing"
-    canvas && canvas.addEventListener("mouseleave", _resetMouseButtons, { passive: true });
-    // Mouse up anywhere: clear buttons even if released outside canvas
-    window.addEventListener("mouseup", _resetMouseButtons, { passive: true });
-    // Scroll wheel hotbar switching (absorbed from __tuWheelBound patch)
-    canvas && canvas.addEventListener("wheel", e => {
-      if (e.ctrlKey) return; // allow browser zoom / trackpad pinch
-      const g = window.AppServices.get("game");
-      const ui = window.AppServices.get("ui");
-      if (!g || !ui || !g.player) return;
-      if (window.AppServices.get("uiState") && window.AppServices.get("uiState").isAnyOpen() || g._inputBlocked) return;
-      const dx = +e.deltaX || 0, dy = +e.deltaY || 0;
-      const delta = (Math.abs(dx) > Math.abs(dy)) ? dx : dy;
-      if (!delta || Math.abs(delta) < 1) return;
-      e.preventDefault();
-      const dir = delta > 0 ? 1 : -1;
-      const cur = Number.isFinite(g.player.selectedSlot) ? (0 | g.player.selectedSlot) : 0;
-      const next = ((cur + dir + 9) % 9);
-      try { window.GameEvents && window.GameEvents.emit && window.GameEvents.emit("ui:selectSlot", next); } catch (_) {}
-    }, { passive: false });
-    // Mark as natively bound so monkey patch skips re-binding
-    this.__tuExtraBound = true;
-    this.__tuInputSafety = true;
-    // === END NATIVE SAFETY ===
     const fullscreenBtn = DOM.byId(UI_IDS.fullscreenBtn);
     fullscreenBtn && fullscreenBtn.addEventListener("click", e => {
       e.preventDefault();
@@ -23703,27 +23391,6 @@ class Game {
     this._screenImpactJitterMs = 0;
     this._screenImpactCenterScale = 1;
     this.input = createInputState();
-    // === CENTRALIZED WEATHER STATE (Single Source of Truth) ===
-    // Previously scattered across game.weather, window.AppServices.get('weatherFx'), and CSS classes.
-    // Now: game.weather is THE canonical state; weatherFx is a read-only derived view.
-    this.weather = {
-      type: "clear",          // clear | rain | snow | thunder | bloodmoon
-      intensity: 0,           // 0-1
-      targetIntensity: 0,     // lerp target
-      nextType: "clear",      // upcoming transition
-      nextIntensity: 0,
-      lightning: 0,           // 0-1 flash intensity
-      acid: false,            // acid rain modifier
-      // PostFX derived params (populated by weather update, read by applyPostFX pipeline)
-      postMode: "source-over",
-      postR: 0, postG: 0, postB: 0, postA: 0,
-      shadowAlpha: 0,
-      shadowColor: "rgb(10,5,20)"
-    };
-    // Register weather as a service for decoupled access
-    window.AppServices.register('weather', this.weather);
-    // Also register weatherFx pointing to same object for backward compatibility
-    if (!window.AppServices.get('weatherFx')) window.AppServices.register('weatherFx', this.weather);
     this.isMobile = Utils.isMobile();
     window.GameEvents.on('player:died', e => {
       const msg = e.kind === 'acid' ? "💀 你被酸雨腐蚀了…" : "💀 你死了…";
@@ -29345,14 +29012,16 @@ window.TU;
           Game = TU.Game,
           InputManager = TU.InputManager,
           AudioManager = TU.AudioManager;
-        // FIXED (Phase 1): Removed duplicate game:init:post emission.
-        // Game.init() already emits 'game:init:post' at the end of its native init flow (line ~24042).
-        // This monkey patch was wrapping Game.init to emit it AGAIN, causing double-fire.
-        // The __tuGameReadyEvent flag is preserved to prevent other patches from re-wrapping.
         if (Game && Game.prototype && !Game.prototype.__tuGameReadyEvent) {
           Game.prototype.__tuGameReadyEvent = !0;
-          // No longer wrapping Game.init - the native emission is sufficient.
-          // Listeners should use: window.GameEvents.on('game:init:post', game => { ... });
+          const _init = Game.prototype.init;
+          "function" == typeof _init && (Game.prototype.init = async function (...args) {
+            const r = await _init.apply(this, args);
+            try {
+              window.GameEvents.emit("game:init:post", this);
+            } catch(e){console.warn('[Catch]',e);}
+            return r;
+          });
         }
         if (InputManager && InputManager.prototype && !InputManager.prototype.__tuInputSafety) {
           InputManager.prototype.__tuInputSafety = !0;
